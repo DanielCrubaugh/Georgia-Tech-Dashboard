@@ -1,0 +1,11 @@
+.venv/
+.idea/
+__pycache__/
+*.py[cod]
+
+# Experiment outputs are reproducible and may include large files.
+artifacts/
+experiment_locks/
+results/
+
+.streamlit/secrets.toml
