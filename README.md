@@ -50,8 +50,8 @@ Use the dashboard in this order:
 
 1. Select chronological **Training end** and **Validation end** dates, leaving later dates for testing.
 2. Click **Train and save model**. This writes a GMM/scaler artifact and metadata to `artifacts/`.
-3. Select that artifact, then click **Validate and lock settings**. This writes the settings and validation metrics to `experiment_locks/` and `results/`.
-4. Select the lock and click **Run final test**. The dashboard loads the locked model/settings without refitting, and saves test trades and a summary in `results/`.
+3. Select that artifact, choose a small predefined validation grid, then click **Validate and lock settings**. The app evaluates each candidate using a daily, capped-position core-plus-tactical portfolio and locks the strongest validation Sharpe result.
+4. Select the lock and click **Run final test**. The dashboard loads the locked model/settings without refitting, checks that the loaded price data match the locked fingerprint, and saves trades, positions, daily P&L, and a summary in `results/`.
 
 After locking settings, **Run bootstrap robustness check** optionally runs 20–250
 multivariate block-bootstrap simulations. Each simulation resamples consecutive
@@ -62,6 +62,8 @@ not be used to tune the locked configuration.
 
 The intended split is chronological: training is used to learn regimes, validation chooses and locks settings, and the final test is not used to tune the model.
 
+Final-test comparisons include a regime-aligned core-plus-tactical portfolio, an all-rare-events core-plus-tactical baseline, and SPY buy-and-hold over identical test dates. The tactical sleeve is allocated across a configurable maximum number of concurrent positions; unused sleeve capital is cash.
+
 ## Build 2 mapping
 
-The dashboard shows the current probabilistic GMM regime, learned cluster evidence, historical conditional event performance, a regime-aware versus unconditional baseline, transaction-cost effects, current/recent signals, confidence, and methodological limitations.
+The dashboard shows the current probabilistic GMM regime, learned cluster evidence, daily portfolio performance, a regime-aware versus unconditional baseline and SPY, transaction-cost effects, position records, confidence, and methodological limitations. Cluster names describe learned short-to-medium-term conditions (`Uptrend / lower volatility`, `Mixed / uncertain`, and `Downtrend / higher volatility`), not formal bull or bear markets.

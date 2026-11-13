@@ -7,7 +7,9 @@ Upload a CSV with Date and adjusted-close columns (for example SPY, AAPL).
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import datetime, timezone
+from itertools import product
 from pathlib import Path
 
 import joblib
@@ -92,9 +94,9 @@ def fit_training_model(features: pd.DataFrame, train_end: pd.Timestamp, clusters
     # Numeric cluster labels have no inherent meaning. Name them from learned properties.
     score = cluster_stats["return_60d"] - cluster_stats["volatility_20d"]
     ordered = score.sort_values().index.tolist()
-    names = {ordered[0]: "Bear / high volatility", ordered[-1]: "Bull / low volatility"}
+    names = {ordered[0]: "Downtrend / higher volatility", ordered[-1]: "Uptrend / lower volatility"}
     for raw_cluster in ordered[1:-1]:
-        names[raw_cluster] = "Sideways / uncertain"
+        names[raw_cluster] = "Mixed / uncertain"
     return {"scaler": scaler, "gmm": gmm, "names": names, "cluster_stats": cluster_stats,
             "features": list(features.columns), "train_end": str(train_end.date())}
 
@@ -122,6 +124,7 @@ def apply_saved_model(features: pd.DataFrame, artifact: dict, validation_end: pd
 def find_events(prices: pd.DataFrame, benchmark: str, regime: pd.DataFrame, z_cutoff: float,
                 holding_days: int, one_way_cost_bps: float, confidence_floor: float) -> pd.DataFrame:
     returns = prices.pct_change()
+    date_series = pd.Series(prices.index, index=prices.index)
     output = []
     for ticker in prices:
         if ticker == benchmark:
@@ -130,7 +133,8 @@ def find_events(prices: pd.DataFrame, benchmark: str, regime: pd.DataFrame, z_cu
         # Entry is next-day close; exit is holding_days later. No same-day execution assumption.
         forward = prices[ticker].shift(-holding_days) / prices[ticker].shift(-1) - 1
         event = pd.DataFrame({"ticker": ticker, "daily_return": returns[ticker], "z_score": z,
-                              "forward_return": forward})
+                              "forward_return": forward, "entry_date": date_series.shift(-1),
+                              "exit_date": date_series.shift(-holding_days)})
         event = event.loc[event["z_score"].abs() >= z_cutoff]
         event["side"] = np.where(event["z_score"] > 0, "Long", "Short")
         output.append(event)
@@ -140,8 +144,8 @@ def find_events(prices: pd.DataFrame, benchmark: str, regime: pd.DataFrame, z_cu
     trades.index.name = "event_date"
     trades["gross_return"] = np.where(trades["side"].eq("Long"), trades["forward_return"], -trades["forward_return"])
     trades["net_return"] = trades["gross_return"] - 2 * one_way_cost_bps / 10_000
-    trades["aligned"] = ((trades["side"].eq("Long") & trades["regime"].eq("Bull / low volatility")) |
-                         (trades["side"].eq("Short") & trades["regime"].eq("Bear / high volatility")))
+    trades["aligned"] = ((trades["side"].eq("Long") & trades["regime"].eq("Uptrend / lower volatility")) |
+                         (trades["side"].eq("Short") & trades["regime"].eq("Downtrend / higher volatility")))
     trades["actionable"] = trades["aligned"] & (trades["confidence"] >= confidence_floor)
     return trades.dropna(subset=["forward_return"])
 
@@ -159,6 +163,74 @@ def stats(returns: pd.Series) -> dict[str, float]:
         "sharpe": np.sqrt(252) * returns.mean() / returns.std() if returns.std() else np.nan,
         "drawdown": dd.min(),
     }
+
+
+def data_fingerprint(prices: pd.DataFrame, benchmark: str) -> str:
+    """Create a reproducible identity for the loaded data and selected benchmark."""
+    ordered = prices.sort_index().sort_index(axis="columns")
+    digest = hashlib.sha256()
+    digest.update(benchmark.encode())
+    digest.update("|".join(map(str, ordered.columns)).encode())
+    digest.update(pd.util.hash_pandas_object(ordered, index=True).values.tobytes())
+    return digest.hexdigest()
+
+
+def select_positions(trades: pd.DataFrame, phase: str, aligned_only: bool, max_positions: int,
+                     phase_end: pd.Timestamp) -> pd.DataFrame:
+    """Admit highest-magnitude event signals while respecting a concurrent-position cap."""
+    candidates = trades.loc[(trades["phase"].eq(phase)) & (trades["exit_date"] <= phase_end)].copy()
+    if aligned_only:
+        candidates = candidates.loc[candidates["actionable"]]
+    candidates["_event_date"] = candidates.index
+    candidates = candidates.sort_values(["_event_date", "z_score"],
+                                        key=lambda value: value.abs() if value.name == "z_score" else value,
+                                        ascending=[True, False])
+    accepted, open_positions = [], []
+    for event_date, group in candidates.groupby(level=0, sort=True):
+        entry_date = group.iloc[0]["entry_date"]
+        open_positions = [position for position in open_positions if position["exit_date"] > entry_date]
+        available = max_positions - len(open_positions)
+        if available <= 0:
+            continue
+        for _, trade in group.head(available).iterrows():
+            record = trade.to_dict()
+            record["event_date"] = event_date
+            open_positions.append(record)
+            accepted.append(record)
+    return pd.DataFrame(accepted)
+
+
+def daily_portfolio_backtest(prices: pd.DataFrame, benchmark: str, trades: pd.DataFrame, phase: str,
+                             phase_dates: pd.DatetimeIndex, aligned_only: bool, core_weight: float,
+                             max_positions: int, one_way_cost_bps: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Mark positions to market daily; unallocated tactical capital remains cash."""
+    phase_start, phase_end = phase_dates.min(), phase_dates.max()
+    positions = select_positions(trades, phase, aligned_only, max_positions, phase_end)
+    daily_index = prices.loc[(prices.index >= phase_start) & (prices.index <= phase_end)].index
+    price_returns = prices.pct_change().reindex(daily_index).fillna(0.0)
+    daily = pd.DataFrame(index=daily_index)
+    daily["SPY buy-and-hold"] = price_returns[benchmark]
+    daily["Core + tactical sleeve"] = core_weight * price_returns[benchmark]
+    tactical_slot = (1 - core_weight) / max_positions
+    if not positions.empty:
+        for _, position in positions.iterrows():
+            active = (daily.index > position["entry_date"]) & (daily.index <= position["exit_date"])
+            direction = 1 if position["side"] == "Long" else -1
+            daily.loc[active, "Core + tactical sleeve"] += tactical_slot * direction * price_returns.loc[active, position["ticker"]]
+            if position["entry_date"] in daily.index:
+                daily.loc[position["entry_date"], "Core + tactical sleeve"] -= tactical_slot * one_way_cost_bps / 10_000
+            if position["exit_date"] in daily.index:
+                daily.loc[position["exit_date"], "Core + tactical sleeve"] -= tactical_slot * one_way_cost_bps / 10_000
+    daily["Cumulative portfolio"] = (1 + daily["Core + tactical sleeve"]).cumprod()
+    daily["Cumulative SPY"] = (1 + daily["SPY buy-and-hold"]).cumprod()
+    return daily, positions
+
+
+def portfolio_metrics(daily_returns: pd.Series, positions: pd.DataFrame) -> dict[str, float]:
+    base = stats(daily_returns)
+    base["positions"] = len(positions)
+    base["total_return"] = (1 + daily_returns).prod() - 1 if not daily_returns.empty else np.nan
+    return base
 
 
 def block_bootstrap_prices(prices: pd.DataFrame, block_days: int, rng: np.random.Generator) -> pd.DataFrame:
@@ -247,6 +319,7 @@ with st.sidebar:
     confidence_floor = st.slider("Minimum regime confidence", 0.34, 0.95, 0.55, 0.01)
     cost_bps = st.number_input("One-way transaction cost (bps)", 0.0, 100.0, 10.0, 1.0)
     core_weight = st.slider("Index-core allocation", 0.60, 0.95, 0.80, 0.05)
+    max_positions = st.slider("Maximum concurrent tactical positions", 1, 12, 5)
 
 try:
     if source == "Class ML4T CSV folder":
@@ -267,6 +340,7 @@ if prices.shape[1] < 2 or len(prices) < 180:
     st.stop()
 
 benchmark = st.sidebar.selectbox("Market benchmark", prices.columns, index=0)
+loaded_data_fingerprint = data_fingerprint(prices, benchmark)
 features = make_features(prices[benchmark].dropna())
 if len(features) < 180:
     st.error("The benchmark has insufficient complete price history for a train/validation/test workflow.")
@@ -279,6 +353,9 @@ st.sidebar.header("Experiment layers")
 train_end = pd.Timestamp(st.sidebar.date_input("Training ends", value=default_train, min_value=date_min, max_value=date_max))
 validation_end = pd.Timestamp(st.sidebar.date_input("Validation ends", value=default_validate, min_value=date_min, max_value=date_max))
 cluster_count = st.sidebar.selectbox("GMM components", [2, 3, 4], index=1)
+candidate_z = st.sidebar.multiselect("Validation z-score candidates", [2.5, 3.0, 3.5], default=[2.5, 3.0, 3.5])
+candidate_holding = st.sidebar.multiselect("Validation holding-period candidates", [5, 10, 20, 40], default=[10, 20])
+candidate_confidence = st.sidebar.multiselect("Validation confidence candidates", [0.45, 0.55, 0.65], default=[0.45, 0.55, 0.65])
 if not train_end < validation_end < features.index.max():
     st.error("Set Training end before Validation end, and leave later dates for the final test.")
     st.stop()
@@ -292,7 +369,13 @@ def lock_paths() -> list[Path]:
 
 
 def save_json(path: Path, content: dict) -> None:
-    path.write_text(json.dumps(content, indent=2, default=str), encoding="utf-8")
+    def convert(value):
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, Path):
+            return str(value)
+        return str(value)
+    path.write_text(json.dumps(content, indent=2, default=convert), encoding="utf-8")
 
 
 st.subheader("1. Research setup and saved layers")
@@ -310,7 +393,8 @@ with train_button:
                 "run_id": run_id, "model_file": artifact_path.name, "benchmark": benchmark,
                 "tickers": list(prices.columns), "feature_start": str(features.index.min().date()),
                 "train_end": str(train_end.date()), "gmm_components": cluster_count,
-                "features": artifact["features"], "created_utc": datetime.now(timezone.utc).isoformat(),
+                "features": artifact["features"], "data_fingerprint": loaded_data_fingerprint,
+                "created_utc": datetime.now(timezone.utc).isoformat(),
             })
             st.success(f"Saved training model: {artifact_path.name}")
         except Exception as error:
@@ -329,22 +413,45 @@ trades = find_events(prices.reindex(features.index).ffill(), benchmark, regime, 
 
 with validate_button:
     if st.button("Validate and lock settings", use_container_width=True):
-        validation_trades = trades.loc[trades["phase"].eq("Validation")]
-        aligned_validation = validation_trades.loc[validation_trades["actionable"]]
+        if not candidate_z or not candidate_holding or not candidate_confidence:
+            st.error("Choose at least one candidate for each validation setting.")
+            st.stop()
+        model_metadata = selected_model.with_suffix(".json")
+        metadata = json.loads(model_metadata.read_text(encoding="utf-8")) if model_metadata.exists() else {}
+        if metadata.get("data_fingerprint") != loaded_data_fingerprint:
+            st.error("This saved model was trained on different data or a different benchmark. Train a new model before validation.")
+            st.stop()
+        validation_dates = regime.index[regime["phase"].eq("Validation")]
+        candidate_rows = []
+        for candidate in product(candidate_z, candidate_holding, candidate_confidence):
+            candidate_trades = find_events(prices.reindex(features.index).ffill(), benchmark, regime,
+                                           float(candidate[0]), int(candidate[1]), cost_bps, float(candidate[2]))
+            daily, positions = daily_portfolio_backtest(prices, benchmark, candidate_trades, "Validation",
+                                                        validation_dates, True, core_weight, max_positions, cost_bps)
+            metrics = portfolio_metrics(daily["Core + tactical sleeve"], positions)
+            candidate_rows.append({"z_cutoff": candidate[0], "holding_days": candidate[1],
+                                   "confidence_floor": candidate[2], **metrics})
+        candidates = pd.DataFrame(candidate_rows)
+        eligible = candidates.loc[candidates["positions"] > 0].copy()
+        if eligible.empty:
+            st.error("No candidate produced a validation position. Lower the event or confidence thresholds.")
+            st.stop()
+        chosen = eligible.sort_values(["sharpe", "total_return"], ascending=False).iloc[0].to_dict()
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         lock = {
             "run_id": run_id, "model_file": selected_model.name, "benchmark": benchmark,
             "train_end": artifact["train_end"], "validation_end": str(validation_end.date()),
-            "z_cutoff": z_cutoff, "holding_days": holding_days,
-            "confidence_floor": confidence_floor, "cost_bps": cost_bps,
-            "validation_regime_aligned": stats(aligned_validation["net_return"]),
-            "validation_all_events": stats(validation_trades["net_return"]),
+            "z_cutoff": chosen["z_cutoff"], "holding_days": int(chosen["holding_days"]),
+            "confidence_floor": chosen["confidence_floor"], "cost_bps": cost_bps,
+            "core_weight": core_weight, "max_positions": max_positions,
+            "data_fingerprint": loaded_data_fingerprint,
+            "selected_validation_metrics": chosen,
             "created_utc": datetime.now(timezone.utc).isoformat(),
         }
         lock_path = LOCK_DIR / f"validation_lock_{run_id}.json"
         save_json(lock_path, lock)
-        validation_trades.reset_index().to_csv(RESULT_DIR / f"validation_trades_{run_id}.csv", index=False)
-        st.success(f"Validation settings locked: {lock_path.name}")
+        candidates.to_csv(RESULT_DIR / f"validation_candidates_{run_id}.csv", index=False)
+        st.success(f"Locked the best validation candidate: z={chosen['z_cutoff']}, hold={int(chosen['holding_days'])} days, confidence={chosen['confidence_floor']:.0%}.")
 
 available_locks = lock_paths()
 if not available_locks:
@@ -356,6 +463,9 @@ lock = json.loads(selected_lock.read_text(encoding="utf-8"))
 
 with test_button:
     if st.button("Run final test", type="primary", use_container_width=True):
+        if lock.get("data_fingerprint") != loaded_data_fingerprint or lock.get("benchmark") != benchmark:
+            st.error("The loaded data or benchmark does not match this validation lock. Reload the original data or create a new experiment.")
+            st.stop()
         locked_artifact = joblib.load(ARTIFACT_DIR / lock["model_file"])
         locked_regime, _ = apply_saved_model(features, locked_artifact, pd.Timestamp(lock["validation_end"]))
         locked_trades = find_events(prices.reindex(features.index).ffill(), benchmark, locked_regime,
@@ -364,14 +474,36 @@ with test_button:
         final_test = locked_trades.loc[locked_trades["phase"].eq("Test")].copy()
         final_test["experiment_lock"] = selected_lock.name
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        final_test.reset_index().to_csv(RESULT_DIR / f"final_test_trades_{run_id}.csv", index=False)
-        save_json(RESULT_DIR / f"final_test_summary_{run_id}.json", {
+        test_dates = locked_regime.index[locked_regime["phase"].eq("Test")]
+        model_daily, model_positions = daily_portfolio_backtest(
+            prices, benchmark, final_test, "Test", test_dates, True, float(lock["core_weight"]),
+            int(lock["max_positions"]), float(lock["cost_bps"])
+        )
+        baseline_daily, baseline_positions = daily_portfolio_backtest(
+            prices, benchmark, final_test, "Test", test_dates, False, float(lock["core_weight"]),
+            int(lock["max_positions"]), float(lock["cost_bps"])
+        )
+        trade_path = RESULT_DIR / f"final_test_trades_{run_id}.csv"
+        daily_path = RESULT_DIR / f"final_test_daily_{run_id}.csv"
+        positions_path = RESULT_DIR / f"final_test_positions_{run_id}.csv"
+        final_test.reset_index().to_csv(trade_path, index=False)
+        pd.DataFrame({"Regime-aligned portfolio": model_daily["Core + tactical sleeve"],
+                      "All-events portfolio": baseline_daily["Core + tactical sleeve"],
+                      "SPY buy-and-hold": model_daily["SPY buy-and-hold"]}).to_csv(daily_path)
+        pd.concat([model_positions.assign(strategy="Regime-aligned"),
+                   baseline_positions.assign(strategy="All events")]).to_csv(positions_path, index=False)
+        summary_path = RESULT_DIR / f"final_test_summary_{run_id}.json"
+        save_json(summary_path, {
             "experiment_lock": selected_lock.name, "test_start": str(pd.Timestamp(lock["validation_end"]) + pd.Timedelta(days=1)),
-            "regime_aligned": stats(final_test.loc[final_test["actionable"], "net_return"]),
-            "all_events": stats(final_test["net_return"]), "created_utc": datetime.now(timezone.utc).isoformat(),
+            "data_fingerprint": loaded_data_fingerprint, "daily_file": daily_path.name,
+            "trade_file": trade_path.name, "positions_file": positions_path.name,
+            "regime_aligned_portfolio": portfolio_metrics(model_daily["Core + tactical sleeve"], model_positions),
+            "all_events_portfolio": portfolio_metrics(baseline_daily["Core + tactical sleeve"], baseline_positions),
+            "spy_buy_hold": portfolio_metrics(model_daily["SPY buy-and-hold"], pd.DataFrame()),
+            "created_utc": datetime.now(timezone.utc).isoformat(),
         })
-        st.session_state["final_test_file"] = str(RESULT_DIR / f"final_test_trades_{run_id}.csv")
-        st.success("Final test saved. Its settings are inherited from the selected validation lock.")
+        st.session_state["final_test_summary"] = str(summary_path)
+        st.success("Final daily portfolio backtest saved. Its data, model, and settings all match the validation lock.")
 
 latest = regime.iloc[-1]
 prob_cols = [column for column in regime if column.startswith("p_")]
@@ -384,7 +516,7 @@ st.subheader("2. Frozen model indication")
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Current regime", latest["regime"])
 col2.metric("GMM confidence", f"{latest['confidence']:.0%}")
-multiplier = {"Bull / low volatility": 1.0, "Sideways / uncertain": 0.5, "Bear / high volatility": 0.25}
+multiplier = {"Uptrend / lower volatility": 1.0, "Mixed / uncertain": 0.5, "Downtrend / higher volatility": 0.25}
 satellite_cap = (1 - core_weight) * sum(row.probability * multiplier[row.regime] for row in probability_table.itertuples())
 col3.metric("Simulated tactical cap", f"{satellite_cap:.1%}")
 col4.metric("Index core", f"{core_weight:.0%}")
@@ -396,25 +528,31 @@ with right:
     st.dataframe(display_stats.style.format({x: "{:.2%}" for x in display_stats.columns if x != "regime"}), use_container_width=True)
 
 st.subheader("3. Final test results")
-test_file = st.session_state.get("final_test_file")
-if test_file and Path(test_file).exists():
-    test = pd.read_csv(test_file, parse_dates=["event_date"]).set_index("event_date")
-    aligned, baseline = test.loc[test["actionable"]], test
-    for column, heading, values in zip(st.columns(2), ["Regime-aligned strategy", "Baseline: all rare events"],
-                                       [stats(aligned["net_return"]), stats(baseline["net_return"])]):
-        with column:
-            st.markdown(f"**{heading}**")
-            st.metric("Trades", int(values["trades"]))
-            st.metric("Mean net trade return", "—" if pd.isna(values["mean"]) else f"{values['mean']:.2%}")
-            st.metric("Win rate", "—" if pd.isna(values["win"]) else f"{values['win']:.1%}")
-            st.metric("Trade-sequence Sharpe", "—" if pd.isna(values["sharpe"]) else f"{values['sharpe']:.2f}")
-
-    baseline_daily = baseline.groupby(level=0)["net_return"].mean()
-    aligned_daily = aligned.groupby(level=0)["net_return"].mean().reindex(baseline_daily.index, fill_value=0)
-    st.line_chart(pd.DataFrame({"Regime-aligned": (1 + aligned_daily).cumprod(),
-                                "All-events baseline": (1 + baseline_daily).cumprod()}))
+saved_summaries = sorted(RESULT_DIR.glob("final_test_summary_*.json"), reverse=True)
+if saved_summaries:
+    default_summary = Path(st.session_state.get("final_test_summary", saved_summaries[0]))
+    summary_index = saved_summaries.index(default_summary) if default_summary in saved_summaries else 0
+    selected_summary = st.selectbox("Saved final-test run", saved_summaries, index=summary_index,
+                                    format_func=lambda path: path.name)
+    summary = json.loads(selected_summary.read_text(encoding="utf-8"))
+    if summary.get("data_fingerprint") != loaded_data_fingerprint:
+        st.warning("This saved result was created with different loaded data or a different benchmark; it is displayed for audit only.")
+    metrics_table = pd.DataFrame([
+        {"Portfolio": "Regime-aligned core + tactical", **summary["regime_aligned_portfolio"]},
+        {"Portfolio": "All-events core + tactical baseline", **summary["all_events_portfolio"]},
+        {"Portfolio": "SPY buy-and-hold", **summary["spy_buy_hold"]},
+    ])
+    st.dataframe(metrics_table.style.format({"mean": "{:.2%}", "win": "{:.1%}", "sharpe": "{:.2f}",
+                                              "drawdown": "{:.2%}", "total_return": "{:.2%}"}),
+                 use_container_width=True, hide_index=True)
+    daily = pd.read_csv(RESULT_DIR / summary["daily_file"], index_col=0, parse_dates=True)
+    st.line_chart((1 + daily).cumprod())
+    positions_file = RESULT_DIR / summary["positions_file"]
+    if positions_file.exists():
+        with st.expander("Saved final-test positions"):
+            st.dataframe(pd.read_csv(positions_file), use_container_width=True, hide_index=True)
 else:
-    st.info("No final test has been run in this session. The final-test files will be written to the results folder.")
+    st.info("Run a final test to create a persistent portfolio comparison against SPY.")
 
 st.subheader("4. Optional block-bootstrap robustness check")
 st.caption("This does not select settings or replace the final test. It estimates how sensitive the locked workflow is to the sampled historical path.")
