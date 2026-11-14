@@ -292,7 +292,7 @@ def bootstrap_robustness(
         except (ValueError, np.linalg.LinAlgError):
             # A rare degenerate resample is recorded as missing rather than used to improve results.
             results.append({"simulation": simulation + 1, "aligned_mean": np.nan, "aligned_sharpe": np.nan,
-                            "aligned_drawdown": np.nan, "aligned_trades": 0, "baseline_mean": np.nan,
+                            "aligned_drawdown": np.nan, "aligned_days": 0, "baseline_mean": np.nan,
                             "baseline_sharpe": np.nan})
     return pd.DataFrame(results)
 
@@ -321,9 +321,6 @@ with st.sidebar:
         data_dir = None
         symbols = ""
         start_date, end_date = None, None
-    z_cutoff = st.slider("Rare-event z-score threshold", 2.0, 4.5, 3.0, 0.1)
-    holding_days = st.select_slider("Holding period", [5, 10, 20, 40], value=20, format_func=lambda x: f"{x} days")
-    confidence_floor = st.slider("Minimum regime confidence", 0.34, 0.95, 0.55, 0.01)
     cost_bps = st.number_input("One-way transaction cost (bps)", 0.0, 100.0, 10.0, 1.0)
     core_weight = st.slider("Index-core allocation", 0.60, 0.95, 0.80, 0.05)
     max_positions = st.slider("Maximum concurrent tactical positions", 1, 12, 5)
@@ -363,6 +360,7 @@ cluster_count = st.sidebar.selectbox("GMM components", [2, 3, 4], index=1)
 candidate_z = st.sidebar.multiselect("Validation z-score candidates", [2.5, 3.0, 3.5], default=[2.5, 3.0, 3.5])
 candidate_holding = st.sidebar.multiselect("Validation holding-period candidates", [5, 10, 20, 40], default=[10, 20])
 candidate_confidence = st.sidebar.multiselect("Validation confidence candidates", [0.45, 0.55, 0.65], default=[0.45, 0.55, 0.65])
+st.sidebar.caption("Validation evaluates every selected threshold, holding-period, and confidence combination, then locks the best one before the final test.")
 if not train_end < validation_end < features.index.max():
     st.error("Set Training end before Validation end, and leave later dates for the final test.")
     st.stop()
@@ -415,8 +413,6 @@ if not available_models:
 selected_model = st.selectbox("Saved training model", available_models, format_func=lambda path: path.name)
 artifact = joblib.load(selected_model)
 regime, cluster_stats = apply_saved_model(features, artifact, validation_end)
-trades = find_events(prices.reindex(features.index).ffill(), benchmark, regime, z_cutoff,
-                     holding_days, cost_bps, confidence_floor)
 
 with validate_button:
     if st.button("Validate and lock settings", use_container_width=True):
