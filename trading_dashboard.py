@@ -108,7 +108,12 @@ def apply_saved_model(features: pd.DataFrame, artifact: dict, validation_end: pd
     probs = artifact["gmm"].predict_proba(artifact["scaler"].transform(features))
     cluster = probs.argmax(axis=1)
     train_end = pd.Timestamp(artifact["train_end"])
-    names = {int(key): value for key, value in artifact["names"].items()}
+    legacy_names = {
+        "Bull / low volatility": "Uptrend / lower volatility",
+        "Sideways / uncertain": "Mixed / uncertain",
+        "Bear / high volatility": "Downtrend / higher volatility",
+    }
+    names = {int(key): legacy_names.get(value, value) for key, value in artifact["names"].items()}
 
     regime = pd.DataFrame(probs, index=features.index, columns=[f"p_{x}" for x in range(probs.shape[1])])
     regime["cluster"] = cluster
