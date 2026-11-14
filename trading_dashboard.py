@@ -233,11 +233,10 @@ def daily_portfolio_backtest(prices: pd.DataFrame, benchmark: str, trades: pd.Da
 
 def portfolio_metrics(daily_returns: pd.Series, positions: pd.DataFrame) -> dict[str, float]:
     base = stats(daily_returns)
-    # ``stats`` calls its observation count ``trades``.  Here observations are
-    # daily portfolio returns, so retain that as an audit field and report the
-    # actual selected positions as the trade count.
-    base["test_days"] = base["trades"]
-    base["trades"] = len(positions)
+    # ``stats`` calls its observation count ``trades``. Here observations are
+    # daily portfolio returns, so use unambiguous portfolio-specific labels.
+    base["test_days"] = base.pop("trades")
+    base["position_entries"] = len(positions)
     base["total_return"] = (1 + daily_returns).prod() - 1 if not daily_returns.empty else np.nan
     return base
 
@@ -441,7 +440,7 @@ with validate_button:
             candidate_rows.append({"z_cutoff": candidate[0], "holding_days": candidate[1],
                                    "confidence_floor": candidate[2], **metrics})
         candidates = pd.DataFrame(candidate_rows)
-        eligible = candidates.loc[candidates["positions"] > 0].copy()
+        eligible = candidates.loc[candidates["position_entries"] > 0].copy()
         if eligible.empty:
             st.error("No candidate produced a validation position. Lower the event or confidence thresholds.")
             st.stop()
