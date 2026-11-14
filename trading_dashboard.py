@@ -158,11 +158,11 @@ def find_events(prices: pd.DataFrame, benchmark: str, regime: pd.DataFrame, z_cu
 def stats(returns: pd.Series) -> dict[str, float]:
     returns = returns.dropna()
     if returns.empty:
-        return {"trades": 0, "mean": np.nan, "win": np.nan, "sharpe": np.nan, "drawdown": np.nan}
+        return {"days": 0, "mean": np.nan, "win": np.nan, "sharpe": np.nan, "drawdown": np.nan}
     wealth = (1 + returns).cumprod()
     dd = wealth / wealth.cummax() - 1
     return {
-        "trades": len(returns),
+        "days": len(returns),
         "mean": returns.mean(),
         "win": (returns > 0).mean(),
         "sharpe": np.sqrt(252) * returns.mean() / returns.std() if returns.std() else np.nan,
@@ -233,9 +233,8 @@ def daily_portfolio_backtest(prices: pd.DataFrame, benchmark: str, trades: pd.Da
 
 def portfolio_metrics(daily_returns: pd.Series, positions: pd.DataFrame) -> dict[str, float]:
     base = stats(daily_returns)
-    # ``stats`` calls its observation count ``trades``. Here observations are
-    # daily portfolio returns, so use unambiguous portfolio-specific labels.
-    base["test_days"] = base.pop("trades")
+    # ``stats`` calls its observation count ``days``. Here observations are
+    # daily portfolio returns; retain that label and separately count entries.
     base["position_entries"] = len(positions)
     base["total_return"] = (1 + daily_returns).prod() - 1 if not daily_returns.empty else np.nan
     return base
@@ -288,7 +287,7 @@ def bootstrap_robustness(
             baseline = stats(test["net_return"])
             results.append({"simulation": simulation + 1, "aligned_mean": aligned["mean"],
                             "aligned_sharpe": aligned["sharpe"], "aligned_drawdown": aligned["drawdown"],
-                            "aligned_trades": aligned["trades"], "baseline_mean": baseline["mean"],
+                            "aligned_days": aligned["days"], "baseline_mean": baseline["mean"],
                             "baseline_sharpe": baseline["sharpe"]})
         except (ValueError, np.linalg.LinAlgError):
             # A rare degenerate resample is recorded as missing rather than used to improve results.
