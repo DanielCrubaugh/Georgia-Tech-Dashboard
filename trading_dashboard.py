@@ -412,15 +412,29 @@ if not available_models:
 
 selected_model = st.selectbox("Saved training model", available_models, format_func=lambda path: path.name)
 artifact = joblib.load(selected_model)
+model_metadata_path = selected_model.with_suffix(".json")
+model_metadata = json.loads(model_metadata_path.read_text(encoding="utf-8")) if model_metadata_path.exists() else {}
 regime, cluster_stats = apply_saved_model(features, artifact, validation_end)
+
+st.subheader("Saved-model inspection")
+st.caption("Inspect this model before validation. These cluster summaries use the selected saved model; they do not retrain it.")
+model_details = pd.DataFrame([{
+    "saved model": selected_model.name,
+    "training ends": model_metadata.get("train_end", artifact.get("train_end", "unknown")),
+    "GMM components": model_metadata.get("gmm_components", artifact["model"].n_components),
+    "benchmark": model_metadata.get("benchmark", benchmark),
+}])
+st.dataframe(model_details, use_container_width=True, hide_index=True)
+inspection_stats = cluster_stats[["regime", "return_20d", "return_60d", "volatility_20d", "drawdown_60d"]]
+st.dataframe(inspection_stats.style.format({x: "{:.2%}" for x in inspection_stats.columns if x != "regime"}),
+             use_container_width=True, hide_index=True)
 
 with validate_button:
     if st.button("Validate and lock settings", use_container_width=True):
         if not candidate_z or not candidate_holding or not candidate_confidence:
             st.error("Choose at least one candidate for each validation setting.")
             st.stop()
-        model_metadata = selected_model.with_suffix(".json")
-        metadata = json.loads(model_metadata.read_text(encoding="utf-8")) if model_metadata.exists() else {}
+        metadata = model_metadata
         if metadata.get("data_fingerprint") != loaded_data_fingerprint:
             st.error("This saved model was trained on different data or a different benchmark. Train a new model before validation.")
             st.stop()
@@ -448,6 +462,7 @@ with validate_button:
             "confidence_floor": chosen["confidence_floor"], "cost_bps": cost_bps,
             "core_weight": core_weight, "max_positions": max_positions,
             "data_fingerprint": loaded_data_fingerprint,
+            "validation_candidates_file": f"validation_candidates_{run_id}.csv",
             "selected_validation_metrics": chosen,
             "created_utc": datetime.now(timezone.utc).isoformat(),
         }
@@ -463,6 +478,16 @@ if not available_locks:
 
 selected_lock = st.selectbox("Locked validation configuration", available_locks, format_func=lambda path: path.name)
 lock = json.loads(selected_lock.read_text(encoding="utf-8"))
+candidate_file = RESULT_DIR / lock.get("validation_candidates_file", f"validation_candidates_{lock.get('run_id', '')}.csv")
+if candidate_file.exists():
+    with st.expander("Inspect saved validation candidates", expanded=True):
+        st.caption("These are the settings compared on validation dates. The selected row is the highest-Sharpe candidate with at least one position entry.")
+        st.dataframe(pd.read_csv(candidate_file).style.format({
+            "mean": "{:.2%}", "win": "{:.1%}", "sharpe": "{:.2f}",
+            "drawdown": "{:.2%}", "total_return": "{:.2%}"
+        }), use_container_width=True, hide_index=True)
+else:
+    st.info("No validation-candidate table is available for this older lock. Create a new validation lock to save one.")
 
 with test_button:
     if st.button("Run final test", type="primary", use_container_width=True):
