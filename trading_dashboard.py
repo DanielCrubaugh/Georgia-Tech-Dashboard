@@ -421,7 +421,7 @@ st.caption("Inspect this model before validation. These cluster summaries use th
 model_details = pd.DataFrame([{
     "saved model": selected_model.name,
     "training ends": model_metadata.get("train_end", artifact.get("train_end", "unknown")),
-    "GMM components": model_metadata.get("gmm_components", artifact["model"].n_components),
+    "GMM components": model_metadata.get("gmm_components", artifact["gmm"].n_components),
     "benchmark": model_metadata.get("benchmark", benchmark),
 }])
 st.dataframe(model_details, use_container_width=True, hide_index=True)
