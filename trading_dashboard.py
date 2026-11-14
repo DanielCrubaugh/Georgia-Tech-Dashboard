@@ -233,7 +233,11 @@ def daily_portfolio_backtest(prices: pd.DataFrame, benchmark: str, trades: pd.Da
 
 def portfolio_metrics(daily_returns: pd.Series, positions: pd.DataFrame) -> dict[str, float]:
     base = stats(daily_returns)
-    base["positions"] = len(positions)
+    # ``stats`` calls its observation count ``trades``.  Here observations are
+    # daily portfolio returns, so retain that as an audit field and report the
+    # actual selected positions as the trade count.
+    base["test_days"] = base["trades"]
+    base["trades"] = len(positions)
     base["total_return"] = (1 + daily_returns).prod() - 1 if not daily_returns.empty else np.nan
     return base
 
