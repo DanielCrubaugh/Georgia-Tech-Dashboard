@@ -13,6 +13,7 @@ from itertools import product
 from pathlib import Path
 
 import joblib
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -566,13 +567,19 @@ for column in prob_cols:
 training_share = (training_regime["regime"].value_counts(normalize=True)
                   .reindex(training_probabilities.columns, fill_value=0.0)
                   .rename("share of training days"))
-history_left, history_right = st.columns(2)
-with history_left:
-    st.caption("GMM regime probabilities by training date")
-    st.line_chart(training_probabilities)
-with history_right:
-    st.caption("Most-likely regime on training dates")
-    st.bar_chart(training_share)
+probability_bars = (training_probabilities.rename_axis("date").reset_index()
+                    .melt(id_vars="date", var_name="regime", value_name="probability"))
+st.caption("GMM probability by training date. Every vertical bar totals 100%; hover over a bar to inspect its regime probabilities.")
+stacked_probability_chart = alt.Chart(probability_bars).mark_bar().encode(
+    x=alt.X("date:T", title="Training date", axis=alt.Axis(format="%Y")),
+    y=alt.Y("probability:Q", stack="normalize", title="Regime probability", axis=alt.Axis(format="%")),
+    color=alt.Color("regime:N", title="Learned regime", sort=list(training_probabilities.columns)),
+    tooltip=[alt.Tooltip("date:T", title="Date"), alt.Tooltip("regime:N", title="Regime"),
+             alt.Tooltip("probability:Q", title="Probability", format=".1%")],
+).properties(height=320)
+st.altair_chart(stacked_probability_chart, use_container_width=True)
+st.caption("Share of training dates by most-likely regime")
+st.bar_chart(training_share)
 
 st.subheader("3. Final test results")
 saved_summaries = sorted(RESULT_DIR.glob("final_test_summary_*.json"), reverse=True)
