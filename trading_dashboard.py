@@ -323,8 +323,11 @@ with st.sidebar:
         symbols = ""
         start_date, end_date = None, None
     cost_bps = st.number_input("One-way transaction cost (bps)", 0.0, 100.0, 10.0, 1.0)
-    core_weight = st.slider("Index-core allocation", 0.60, 0.95, 0.80, 0.05)
-    max_positions = st.slider("Maximum concurrent tactical positions", 1, 12, 5)
+    core_weight_pct = st.number_input("Index-core allocation (%)", 0.0, 100.0, 80.0, 5.0,
+                                      help="Enter the percentage allocated to the index core. The remainder is available to the tactical sleeve.")
+    core_weight = core_weight_pct / 100.0
+    position_caps = list(range(1, 13))
+    st.caption("Validation tests every concurrent-position cap from 1 through 12 and graphs the trade-offs below.")
 
 try:
     if source == "Class ML4T CSV folder":
@@ -441,14 +444,14 @@ with validate_button:
             st.stop()
         validation_dates = regime.index[regime["phase"].eq("Validation")]
         candidate_rows = []
-        for candidate in product(candidate_z, candidate_holding, candidate_confidence):
+        for candidate in product(candidate_z, candidate_holding, candidate_confidence, position_caps):
             candidate_trades = find_events(prices.reindex(features.index).ffill(), benchmark, regime,
                                            float(candidate[0]), int(candidate[1]), cost_bps, float(candidate[2]))
             daily, positions = daily_portfolio_backtest(prices, benchmark, candidate_trades, "Validation",
-                                                        validation_dates, True, core_weight, max_positions, cost_bps)
+                                                        validation_dates, True, core_weight, int(candidate[3]), cost_bps)
             metrics = portfolio_metrics(daily["Core + tactical sleeve"], positions)
             candidate_rows.append({"z_cutoff": candidate[0], "holding_days": candidate[1],
-                                   "confidence_floor": candidate[2], **metrics})
+                                   "confidence_floor": candidate[2], "max_positions": candidate[3], **metrics})
         candidates = pd.DataFrame(candidate_rows)
         eligible = candidates.loc[candidates["position_entries"] > 0].copy()
         if eligible.empty:
@@ -461,7 +464,7 @@ with validate_button:
             "train_end": artifact["train_end"], "validation_end": str(validation_end.date()),
             "z_cutoff": chosen["z_cutoff"], "holding_days": int(chosen["holding_days"]),
             "confidence_floor": chosen["confidence_floor"], "cost_bps": cost_bps,
-            "core_weight": core_weight, "max_positions": max_positions,
+            "core_weight": core_weight, "max_positions": int(chosen["max_positions"]),
             "data_fingerprint": loaded_data_fingerprint,
             "validation_candidates_file": f"validation_candidates_{run_id}.csv",
             "selected_validation_metrics": chosen,
@@ -470,7 +473,7 @@ with validate_button:
         lock_path = LOCK_DIR / f"validation_lock_{run_id}.json"
         save_json(lock_path, lock)
         candidates.to_csv(RESULT_DIR / f"validation_candidates_{run_id}.csv", index=False)
-        st.success(f"Locked the best validation candidate: z={chosen['z_cutoff']}, hold={int(chosen['holding_days'])} days, confidence={chosen['confidence_floor']:.0%}.")
+        st.success(f"Locked the best validation candidate: z={chosen['z_cutoff']}, hold={int(chosen['holding_days'])} days, confidence={chosen['confidence_floor']:.0%}, cap={int(chosen['max_positions'])} positions.")
 
 available_locks = lock_paths()
 if not available_locks:
@@ -482,8 +485,22 @@ lock = json.loads(selected_lock.read_text(encoding="utf-8"))
 candidate_file = RESULT_DIR / lock.get("validation_candidates_file", f"validation_candidates_{lock.get('run_id', '')}.csv")
 if candidate_file.exists():
     with st.expander("Inspect saved validation candidates", expanded=True):
+        candidates = pd.read_csv(candidate_file)
         st.caption("These are the settings compared on validation dates. The selected row is the highest-Sharpe candidate with at least one position entry.")
-        st.dataframe(pd.read_csv(candidate_file).style.format({
+        if "max_positions" in candidates.columns:
+            st.markdown("**Concurrent-position sensitivity (validation only)**")
+            st.caption("Each point is the highest-Sharpe eligible event-setting combination at that position cap. This compares the best available validation result at each cap; it is not a final-test result.")
+            cap_sensitivity = (candidates.loc[candidates["position_entries"] > 0]
+                               .sort_values(["max_positions", "sharpe", "total_return"], ascending=[True, False, False])
+                               .groupby("max_positions", as_index=False).first())
+            return_col, sharpe_col, drawdown_col = st.columns(3)
+            return_col.line_chart(cap_sensitivity.set_index("max_positions")[["total_return"]])
+            sharpe_col.line_chart(cap_sensitivity.set_index("max_positions")[["sharpe"]])
+            drawdown_col.line_chart(cap_sensitivity.set_index("max_positions")[["drawdown"]])
+            return_col.caption("Total return")
+            sharpe_col.caption("Sharpe ratio")
+            drawdown_col.caption("Maximum drawdown")
+        st.dataframe(candidates.style.format({
             "mean": "{:.2%}", "win": "{:.1%}", "sharpe": "{:.2f}",
             "drawdown": "{:.2%}", "total_return": "{:.2%}"
         }), use_container_width=True, hide_index=True)
