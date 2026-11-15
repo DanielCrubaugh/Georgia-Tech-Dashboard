@@ -22,13 +22,16 @@ the shared Python environment.
 
 ## Data
 
-The default source is a local ML4T-style folder containing one CSV per ticker.
+The default source is the repository's bundled `data/` folder, which contains
+the five tickers used by the default dashboard setup: SPY, AAPL, MSFT, JPM, and
+XOM. You can instead select any local ML4T-style folder containing one CSV per
+ticker.
 The dashboard includes a local `util.py` copy with the course `get_data` pattern,
 but uses an explicit folder input rather than relying on `MARKET_DATA_DIR`.
 Its default location is:
 
 ```text
-/home/daniel/ml4t_files/assess_learners_2026Fall/ml4t_env/data
+data/
 ```
 
 Enter tickers such as `AAPL, MSFT, JPM, XOM`; `SPY` is added automatically as

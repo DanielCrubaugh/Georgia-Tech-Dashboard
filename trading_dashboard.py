@@ -304,7 +304,9 @@ st.caption("Research dashboard: simulated long/short event positions, not invest
 with st.sidebar:
     st.header("Data and settings")
     source = st.radio("Data source", ["Class ML4T CSV folder", "Upload combined CSV", "Synthetic demo data"])
-    class_dir = "/home/daniel/ml4t_files/assess_learners_2026Fall/ml4t_env/data"
+    bundled_data_dir = APP_DIR / "data"
+    class_dir = str(bundled_data_dir if bundled_data_dir.exists()
+                    else "/home/daniel/ml4t_files/assess_learners_2026Fall/ml4t_env/data")
     if source == "Class ML4T CSV folder":
         data_dir = st.text_input("ML4T data folder", value=class_dir)
         symbols = st.text_input("Tickers to scan (SPY is added automatically)", value="AAPL, MSFT, JPM, XOM")
