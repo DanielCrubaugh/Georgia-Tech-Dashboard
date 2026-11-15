@@ -555,6 +555,25 @@ with right:
     display_stats = cluster_stats[["regime", "return_20d", "return_60d", "volatility_20d", "drawdown_60d"]]
     st.dataframe(display_stats.style.format({x: "{:.2%}" for x in display_stats.columns if x != "regime"}), use_container_width=True)
 
+st.subheader("Training-regime history")
+st.caption("The current-regime indicator above is only the most recent date. These charts show the regimes learned across all training dates.")
+training_regime = regime.loc[regime["phase"].eq("Training")].copy()
+training_probabilities = pd.DataFrame(index=training_regime.index)
+for column in prob_cols:
+    raw_cluster = int(column.split("_")[1])
+    regime_name = cluster_stats.loc[raw_cluster, "regime"]
+    training_probabilities[regime_name] = training_probabilities.get(regime_name, 0.0) + training_regime[column]
+training_share = (training_regime["regime"].value_counts(normalize=True)
+                  .reindex(training_probabilities.columns, fill_value=0.0)
+                  .rename("share of training days"))
+history_left, history_right = st.columns(2)
+with history_left:
+    st.caption("GMM regime probabilities by training date")
+    st.line_chart(training_probabilities)
+with history_right:
+    st.caption("Most-likely regime on training dates")
+    st.bar_chart(training_share)
+
 st.subheader("3. Final test results")
 saved_summaries = sorted(RESULT_DIR.glob("final_test_summary_*.json"), reverse=True)
 if saved_summaries:
